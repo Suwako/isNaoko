@@ -17,6 +17,7 @@ import socket
 import struct
 import threading
 import re
+from urllib import urlencode
 from urllib2 import Request, urlopen
 from collections import namedtuple, deque
 import ConfigParser
@@ -61,7 +62,7 @@ class hasPermission(object):
             # Hybrid mods can be disabled
             name = user.name.lower()
             # Mods implicitly have all permissions
-            if user.rank >= 2 or (self.leader and user.leader) or (user.rank >= 1 and naoko.hybridModStatus and name in naoko.hybridModList and (naoko.hybridModList[name] & naoko.MASKS[mask][0])):
+            if user.permissions >= 10 or (self.leader and user.leader) or (user.loggedin and naoko.hybridModStatus and name in naoko.hybridModList and (naoko.hybridModList[name] & naoko.MASKS[mask][0])):
                 return fn(naoko, command, user, *args, **kwargs)
             elif not self.required:
                 # Some commands allow users without permissions to take limited actions
@@ -92,8 +93,8 @@ eight_choices = [
     "Very doubtful"]
 
 # Simple Record Types for variable synchtube constructs
-CytubeUser = namedtuple("CytubeUser",
-                           ["name", "rank", "leader", "meta", "profile", "msgs"])
+InstaSynchUser = namedtuple("InstaSynchUser",
+                           ["id", "ip", "name", "permissions", "room", "loggedin", "leader", "msgs"])
 
 CytubeVideo = namedtuple("CytubeVideo",
                               ["vidinfo", "queueby", "temp", "uid"])
@@ -104,7 +105,7 @@ CytubeVideo = namedtuple("CytubeVideo",
                               # duration also exists but seems to be for display purposes only. It is currently ignored.
 CytubeVidInfo = namedtuple("CytubeVidInfo", ["type", "id", "title", "seconds"])
 
-IRCUser = namedtuple("IRCUser", ["name", "rank", "leader"])
+IRCUser = namedtuple("IRCUser", ["name", "permissions", "leader"])
 
 # Generic object that can be assigned attributes
 class Object(object):
@@ -120,6 +121,14 @@ class Object(object):
 # second is uid, third is whether or not client is authenticated
 # fourth is avatar type, and so on.
 class Naoko(object):
+
+    def setHeaders(self):
+        self.HEADERS = {'User-Agent' : 'NaokoBot',
+                'Accept' : 'text/html,application/xhtml+xml,application/xml;',
+                'Host' : self.domain,
+                'Connection' : 'keep-alive',
+                'Origin' : 'http://' + self.domain,
+                'Referer' : 'http://' + self.domain}
     
     # Bitmasks for hybrid mods.
     MASKS = {
@@ -175,6 +184,7 @@ class Naoko(object):
         self.thread.close = self.close
 
         self._getConfig()
+        self.setHeaders()
 
         # If more than one thread attempts to close Naoko at the same time it will cause an error
         self.closeLock = threading.Lock()
@@ -253,25 +263,28 @@ class Naoko(object):
         
         self.userlist = {}
 
-        self.io_url = self._readIOUrl()
+        # Log in
+        # TODO - Save the cookie when possible
+        self.logger.info("Attempting to login")
+        login_url = "http://%s/ajax/login.php" % (self.domain)
+        login_body = {'username' : self.name.encode('utf-8'), 'password' : self.pw.encode('utf-8')};
+        login_data = urlencode(login_body)
+        login_req = Request(login_url, data=login_data, headers=self.HEADERS)
+        login_req.add_header('X-Requested-With', 'XMLHttpRequest')
+        login_req.add_header('Content', 'XMLHttpRequest')
+        login_res = urlopen(login_req)
+        login_res_headers = login_res.info()
+        # Reasonable guess at a required length for when both cookies are present
+        if len(login_res_headers['Set-Cookie']) < 100:
+            raise Exception("Could not login")
 
-        if not self.io_url:
-            self.logger.info("Retrieving IO_URL")
-            try:
-                io_url = urlopen("http://%s/assets/js/iourl.js" % (self.domain)).read()
-                # Unless someone has changed their iourl.js a lot this is going to work
-                self.io_url = io_url[io_url.rfind("var IO_URL"):].split('"')[1]
-            except Exception:
-                self.logger.warning("Unable to load iourl.js, using default io_url if available.")
-                self.io_url = self.default_io_url 
-        else:
-            self._writeIOUrl("")
+        self.cookie = login_res_headers['Set-Cookie']
+        self.logger.info("Login successful")
 
-        # Assume HTTP because Naoko can't handle other protocols anyway
-        socket_ip, socket_port = self.io_url[7:].split(':')
+        socket_ip, socket_port = self.domain, "38000"
         
         self.logger.info("Starting SocketIO Client")
-        self.client = SocketIOClient(socket_ip, int(socket_port), "socket.io", {"t": int(round(time.time() * 1000))})
+        self.client = SocketIOClient(socket_ip, int(socket_port), "socket.io", {"t": int(round(time.time()))})
         
         # Various queues and events used to sychronize actions in separate threads
         # Some are initialized with maxlen = 0 so they will silently discard actions meant for non-existent threads
@@ -295,13 +308,10 @@ class Naoko(object):
         self.mumbleclient = False
 
         # Set a default selfUser with admin permissions, it will be updated later
-        self.selfUser = CytubeUser(self.name, 3, False, {"afk": False}, {"text": "", "image": ""}, deque(maxlen=3))
+        self.selfUser = False
 
-        # Connect to the room
-        self.send("joinChannel", {"name": self.room})
-        
-        # Log In
-        self.send ("login", {"name": self.name, "pw": self.pw})
+        # Join the room as a logged in user
+        self.send ("join", {"username": self.name, "cookie": self.cookie.split("sessionid=", 1)[1].split(";", 1)[0], "room": self.room})
 
         # Start the threads that are required for all normal operation
         self.chatthread = threading.Thread(target=Naoko._chatloop, args=[self])
@@ -698,21 +708,6 @@ class Naoko(object):
             if f:
                 f.close()
     
-    # Read the IO_URL cache
-    def _readIOUrl(self):
-        self.logger.debug("Reading io_url.")
-        f = None
-        try:
-            f = open("iourlcache", "rb")
-            return f.readline().strip()
-        except Exception as e:
-            self.logger.debug("Reading cached io_url failed.")
-            self.logger.debug(e)
-            return False
-        finally:
-            if f:
-                f.close()
-
     def _initHandlers(self):
         """              "leader"           : self.leader,
                          "history"          : self.roomSetting,
@@ -721,7 +716,7 @@ class Naoko(object):
                          "num_votes"        : self.roomSetting,
                          "self"             : self.selfInfo,
                          "kick"             : self.kicked}"""
-        self.handlers = {"chatMsg"          : self.chat,
+        """self.handlers = {"chatMsg"          : self.chat,
                         "channelOpts"       : self.channelOpts,
                         "userlist"          : self.users,
                         "addUser"           : self.addUser,
@@ -745,22 +740,14 @@ class Naoko(object):
                         "usercount"         : self.userCount,
                         "login"             : self.login,
                         "setPlaylistLocked" : self.playlistLock,
-                        "setAFK"            : self.setAFK}
-                        #leader  -- Use being leader as a signal to actively manage the playlist?
-                                # -- Requires actually implementing media switching and sending mediaUpdates every 5 seconds
-                                                    # Note: seems to be 5 seconds regardless of if a media switch has occurred
-                                # could make $lead a toggle and it'd provide good 
-                        #updateUser - worry about selfUser, maybe make selfUser a function
-                        #disconnect
-                        #accouncement
-                        #voteskip (count, need)
-                        #kick
-                        #banlist
-                        #drinkCount - probably ignore
-                        # poll information probably doesn't need to be tracked unless I need to track whether a poll is open
-                                    # newPoll/updatePoll/closePoll
-                        # seenlogins - used to determine valid targets for bans
-                        # joinMessage
+                        "setAFK"            : self.setAFK}"""
+        self.handlers = {"add-user"         : self.addUser,
+                        "remove-user"       : self.remUser,
+                        "rename"            : self.rename,
+                        "userinfo"          : self.selfInfo,
+                        "userlist"          : self.users,
+                        "play"              : self.play,
+                        "chat"              : self.chat}
 
     def _initCommandHandlers(self):
         """
@@ -793,14 +780,12 @@ class Naoko(object):
                                 "help"              : self.help,
                                 "eval"              : self.eval,
                                 "steak"             : self.steak,
-                                "poll"              : self.poll,
-                                "endpoll"           : self.endPoll,
                                 # Functions that require a database
-                                "addrandom"         : self.addRandom,
-                                "blacklist"         : self.blacklist,
+                                #"addrandom"         : self.addRandom,
+                                #"blacklist"         : self.blacklist,
                                 "quote"             : self.quote,
-                                "saveplaylist"      : self.savePlaylist,
-                                "deleteplaylist"    : self.deletePlaylist,
+                                #"saveplaylist"      : self.savePlaylist,
+                                #"deleteplaylist"    : self.deletePlaylist,
                                 # Functions that query an external API
                                 "cleverbot"         : self.cleverbot,
                                 "translate"         : self.translate,
@@ -809,8 +794,9 @@ class Naoko(object):
                                 # Functions for controlling Naoko that do not affect the room or permissions
                                 "restart"           : self.restart,
                                 "mute"              : self.mute,
-                                "unmute"            : self.unmute,
-                                # Functions that modify the playlist
+                                "unmute"            : self.unmute}
+        """
+                                # Functions that modify the playlist or room
                                 "clean"             : self.cleanList,
                                 "duplicates"        : self.cleanDuplicates,
                                 "delete"            : self.delete,
@@ -824,10 +810,12 @@ class Naoko(object):
                                 "accident"          : self.accident,
                                 "loadplaylist"      : self.loadPlaylist,
                                 "shuffle"           : self.shuffleList,
+                                "poll"              : self.poll,
+                                "endpoll"           : self.endPoll,
                                 # Functions that change the states of users
                                 "kick"              : self.kick,
                                 # Other
-                                "setskip"           : self.setSkip}
+                                "setskip"           : self.setSkip}"""
                                 
 
     def _initIRCCommandHandlers(self):
@@ -946,7 +934,7 @@ class Naoko(object):
 
     def sendChat(self, msg):
         #self.logger.debug(repr(msg))
-        self.send("chatMsg", {"msg": msg})
+        self.send("message", {"message": msg})
 
     def send(self, tag='', data=''):
         buf = {"name": tag}
@@ -995,6 +983,9 @@ class Naoko(object):
     # Handlers for Cytube message types
     # All of them receive input in the form (tag, data)
 
+    def play(self, tag, data):
+        self.doneInit = True
+    
     def currentVideo(self, tag, data):
         old = self.state.current
         self.state.current = self.getVideoIndexById(data)
@@ -1104,6 +1095,11 @@ class Naoko(object):
         self.logger.debug("Ignoring %s", tag)
         #self.logger.debug("Ignoring %s, %s", tag, data)
 
+    def rename(self, tag, data):
+        id = data["id"]
+        nick = data["username"]
+        self.userlist[id]= self.userlist[id]._replace(name=nick)
+
     def login(self, tag, data):
         if not data["success"] or "error" in data:
             if "error" in data:
@@ -1121,23 +1117,26 @@ class Naoko(object):
         if not data["afk"]:
             self.sendChat("/afk")
         
-    def addUser(self, tag, data, isSelf=False):
-        self._addUser(data, data["name"] == self.name)
-  
+    def addUser(self, tag, data):
+        self._addUser(data["user"])
+ 
+    def selfInfo(self, tag, data):
+        self._addUser(data, True)
+
     # Stores the number of viewers, not just the number of named users
     def userCount(self, tag, data):
         self._storeUserCount(data)
 
     def remUser(self, tag, data):
         try:
-            del self.userlist[data["name"]]
-            if self.pending.has_key(data["name"]):
-                del self.pending[data["name"]]
+            del self.userlist[data["userId"]]
+            if self.pending.has_key(data["userId"]):
+                del self.pending[data["userId"]]
         except KeyError:
-            self.logger.exception("Failure to delete user %s from %s", data["name"], self.userlist)
+            self.logger.exception("Failure to delete user %s from %s", data["userId"], self.userlist)
 
     def users(self, tag, data):
-        for u in data:
+        for u in data["userlist"]:
             self._addUser(u)
 
     # REIMPLEMENT
@@ -1184,25 +1183,24 @@ class Naoko(object):
         # Best to just ignore every chat message until initialization is done
         if not self.doneInit: return
        
-        if not data["username"] in self.userlist: return
+        if not data["user"]["id"] in self.userlist: return
 
-        user = self.userlist[data["username"]]
-        msg = self._fixChat(data["msg"])
+        user = self.userlist[data["user"]["id"]]
+        msg = self._fixChat(data["message"])
 
         self.chat_logger.info("%s: %r" , user.name, msg)
         if not user.name == self.name and self.doneInit:
             self.enqueueMsg(("(" + user.name + ") " + msg), st=False)
         
         # Only interpret regular messages as commands
-        if not data["meta"].get("addClass"):
-            self.chatCommand(user, msg)
+        self.chatCommand(user, msg)
         
         # Don't log messages from IRC, may result in a few unlogged messages
         if user.name != self.name or not msg or msg[0] != '(':
             self.sqlExecute(package(self.insertChat, msg=msg, username=user.name, 
-                    userid=user.name, timestamp=None, protocol='CT', channel=self.room, flags=None))
+                    userid=user.name, timestamp=None, protocol="IS", channel=self.room, flags=None))
 
-        if user.rank >= 2 or user.name == self.name: return
+        if user.name == self.name: return
 
         # REIMPLEMENT
         """
@@ -1374,7 +1372,7 @@ class Naoko(object):
         self.send("shufflePlaylist")
 
     def help(self, command, user, data):
-        self.enqueueMsg("I only do this out of pity. https://raw.github.com/Suwako/cyNaoko/master/commands.txt")
+        self.enqueueMsg("I only do this out of pity. https://raw.github.com/Suwako/isNaoko/master/commands.txt")
         #self.enqueueMsg("I refuse; you are beneath me.")
 
     # Creates a poll given an asterisk separated list of strings containing the title and at least two choices.
@@ -1865,7 +1863,7 @@ class Naoko(object):
         self.sqlExecute(package(self._quote, data))
     
     def _quote(self, name):
-        row = self.dbclient.getQuote(name, [(self.name, "ST"), (self.irc_nick, "IRC"), (self.name, "CT")])
+        row = self.dbclient.getQuote(name, [(self.name, "ST"), (self.irc_nick, "IRC"), (self.name, "CT"), (self.name, "IS")])
         if row:
             self.enqueueMsg("[%s %s-%s] %s" % (row[0], row[3],  datetime.fromtimestamp(row[2] / 1000).isoformat(' '), row[1])) 
 
@@ -2249,24 +2247,24 @@ class Naoko(object):
         output = value
 
         # Replace html tags with whatever they replaced
-        output = re.sub(r"</?strong>", "*", output)
-        output = re.sub(r"</?em>", "_", output)
-        output = re.sub(r"</?code>", "`", output)
-        output = re.sub(r"</?s>", "~~", output)
+        #output = re.sub(r"</?strong>", "*", output)
+        #output = re.sub(r"</?em>", "_", output)
+        #output = re.sub(r"</?code>", "`", output)
+        #output = re.sub(r"</?s>", "~~", output)
 
 
         # Remove any other html tags that were added
-        output = output.split("<")
-        for i, val in enumerate(output):
-            if ">" in val:
-                output[i] = val.split(">", 1)[1]
-        output = "".join(output)
+        #output = output.split("<")
+        #for i, val in enumerate(output):
+        #    if ">" in val:
+        #        output[i] = val.split(">", 1)[1]
+        #output = "".join(output)
 
         # Unescape &gt; and &lt;
         output = output.replace("&gt;", ">")
         output = output.replace("&lt;", "<")
-        output = output.replace("&quot;", "\"")
-        output = output.replace("&amp;", "&")
+        #output = output.replace("&quot;", "\"")
+        #output = output.replace("&amp;", "&")
 
         return output
 
@@ -2277,20 +2275,23 @@ class Naoko(object):
 
     # Add the user described by u_dict
     def _addUser(self, u_dict, isSelf=False):
+                           #["id", "ip", "name", "permissions", "room", "loggedin", "leader", "msgs"])
+        if self.selfUser and u_dict["id"] == self.selfUser.id: return
         userinfo = u_dict.copy()
         #userinfo['nick'] = self.filterString(userinfo['nick'], True)[1]
         userinfo['msgs'] = deque(maxlen=3)
         #userinfo['nickChanges'] = 0
         userinfo["leader"] = False
-        assert set(userinfo.keys()) == set(CytubeUser._fields), "User information has changed formats. Tell Desuwa."
-        user = CytubeUser(**userinfo)
-        self.userlist[user.name] = user
+        userinfo["name"] = userinfo["username"]
+        del userinfo["username"]
+        assert set(userinfo.keys()) == set(InstaSynchUser._fields), "User information has changed formats. Tell Desuwa."
+        user = InstaSynchUser(**userinfo)
+        self.userlist[user.id] = user
         if isSelf:
             self.selfUser = user
             
             # Avoid issues with empty rooms
             if not self.doneInit:
-                self._writeIOUrl(self.io_url)
                 if self.managing and self.state.state == self._STATE_UNKNOWN:
                     self.stExecute(package(self.addRandom, "addrandom", self.selfUser, ""))
                 self.doneInit = True
@@ -2319,20 +2320,6 @@ class Naoko(object):
             if f:
                 f.close()
     
-    # Write the current status of the hybrid mods and a short warning about editing the resulting file.
-    def _writeIOUrl(self, io_url):
-        f = None
-        self.logger.debug("Writing io_url to file.")
-        try:
-            f = open("iourlcache", "wb")
-            f.write(io_url + "\n")
-        except Exception as e:
-            self.logger.debug("Failed to write io_url.")
-            self.logger.debug(e)
-        finally:
-            if f:
-                f.close()
-
     # Marks a video with the specified flags.
     # 1 << 0    : Invalid video, may become valid in the future. Reset upon successful manual add.
     # 1 << 1    : Manually blacklisted video.
@@ -2703,7 +2690,6 @@ class Naoko(object):
         self.name = config.get("naoko", "nick")
         self.pw   = config.get("naoko", "pass")
         self.domain = config.get("naoko", "domain")
-        self.default_io_url = config.get("naoko", "default_io_url")
         self.repl_port = config.get("naoko", "repl_port")
         self.hmod_admin = config.get("naoko", "hmod_admin").lower()
         self.spam_interval = float(config.get("naoko", "spam_interval"))
