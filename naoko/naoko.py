@@ -459,6 +459,11 @@ class Naoko(object):
                 data = self.filterString(frame.popleft().strip())[1]
                 if data.find("PING :") != -1:
                     client.ping()
+                    if self.ircpw and not client.loggedIn:
+                        client.send("PRIVMSG nickserv :id " + self.ircpw + "\n")
+                    if not client.inChannel:
+                        client.send("JOIN " + self.channel + "\n")
+
                 elif data.find("PRIVMSG " + self.channel + " :") != -1:
                     name = data.split('!', 1)[0][1:]
                     msg = data[data.find("PRIVMSG " + self.channel + " :") + len("PRIVMSG " + self.channel + " :"):]
@@ -907,7 +912,9 @@ class Naoko(object):
 
     # Enqueues a message for sending to both IRC and Synchtube
     # This should not be used for bridging chat between IRC and Synchtube
-    def enqueueMsg(self, msg, st=True, irc=True, mumble=True):
+    def enqueueMsg(self, m, st=True, irc=True, mumble=True):
+        msg = re.match(r"([/$])*(.*)", m, re.IGNORECASE | re.DOTALL).groups()[1]
+        if not msg: return
         if irc: self.irc_queue.append(msg)
         if st: self.st_queue.append(msg)
         if mumble: self.mumble_queue.append(msg)
